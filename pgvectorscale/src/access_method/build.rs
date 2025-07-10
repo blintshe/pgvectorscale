@@ -1,9 +1,14 @@
 use std::time::Instant;
+use std::cell::Cell;
 
 use pg_sys::{FunctionCall0Coll, InvalidOid};
 use pgrx::ffi::c_char;
 use pgrx::pg_sys::{index_getprocinfo, pgstat_progress_update_param, AsPgCStr, Oid};
 use pgrx::*;
+
+thread_local! {
+    static PARALLEL_SHM_TOC: Cell<*mut pg_sys::shm_toc> = Cell::new(std::ptr::null_mut());
+}
 
 use crate::access_method::distance::DistanceType;
 use crate::access_method::graph::neighbor_store::GraphNeighborStore;
@@ -167,7 +172,7 @@ pub extern "C" fn ambuild(
 
     // TODO: unsafe { (*index_info).ii_ParallelWorkers };
     let workers = if cfg!(feature = "build_parallel") {
-        1
+        2 // TODO
     } else {
         0
     };
@@ -263,6 +268,7 @@ pub extern "C" fn ambuild(
             &index_relation,
             meta_page,
             write_stats,
+            false,
         )
     };
 
@@ -497,12 +503,18 @@ pub extern "C-unwind" fn _vectorscale_build_main(
     let index_relation = unsafe { PgRelation::from_pg(indexrel) };
     let meta_page = MetaPage::fetch(&index_relation);
 
+    // Store the shm_toc in a thread-local variable for access during parallel scan
+    PARALLEL_SHM_TOC.with(|toc_cell| {
+        toc_cell.set(shm_toc);
+    });
+
     let ntuples = do_heap_scan(
         index_info,
         &heap_relation,
         &index_relation,
         meta_page,
         WriteStats::default(),
+        true,
     );
 
     unsafe {
@@ -517,6 +529,7 @@ fn do_heap_scan(
     index_relation: &PgRelation,
     mut meta_page: MetaPage,
     mut write_stats: WriteStats,
+    parallel: bool,
 ) -> usize {
     unsafe {
         pgstat_progress_update_param(PROGRESS_CREATE_IDX_SUBPHASE, BUILD_PHASE_BUILDING_GRAPH);
@@ -540,14 +553,20 @@ fn do_heap_scan(
             let mut bs = BuildState::new(index_relation, graph, page_type);
             let mut state = StorageBuildState::Plain(&mut plain, &mut bs);
 
-            unsafe {
-                pg_sys::IndexBuildHeapScan(
-                    heap_relation.as_ptr(),
-                    index_relation.as_ptr(),
-                    index_info,
-                    Some(build_callback),
-                    &mut state,
-                );
+            if parallel {
+                unsafe {
+                    do_parallel_heap_scan(heap_relation, index_relation, index_info, &mut state);
+                }
+            } else {
+                unsafe {
+                    pg_sys::IndexBuildHeapScan(
+                        heap_relation.as_ptr(),
+                        index_relation.as_ptr(),
+                        index_info,
+                        Some(build_callback),
+                        &mut state,
+                    );
+                }
             }
 
             finalize_index_build(&mut plain, bs, index_relation, write_stats)
@@ -566,14 +585,20 @@ fn do_heap_scan(
             let mut bs = BuildState::new(index_relation, graph, page_type);
             let mut state = StorageBuildState::SbqSpeedup(&mut bq, &mut bs);
 
-            unsafe {
-                pg_sys::IndexBuildHeapScan(
-                    heap_relation.as_ptr(),
-                    index_relation.as_ptr(),
-                    index_info,
-                    Some(build_callback),
-                    &mut state,
-                );
+            if parallel {
+                unsafe {
+                    do_parallel_heap_scan(heap_relation, index_relation, index_info, &mut state);
+                }
+            } else {
+                unsafe {
+                    pg_sys::IndexBuildHeapScan(
+                        heap_relation.as_ptr(),
+                        index_relation.as_ptr(),
+                        index_info,
+                        Some(build_callback),
+                        &mut state,
+                    );
+                }
             }
 
             unsafe {
@@ -643,6 +668,93 @@ fn finalize_index_build<S: Storage>(
     notice!("Indexed {} tuples", ntuples);
 
     ntuples
+}
+
+#[cfg(feature = "build_parallel")]
+unsafe fn do_parallel_heap_scan(
+    heap_relation: &PgRelation,
+    index_relation: &PgRelation,
+    _index_info: *mut pg_sys::IndexInfo,
+    state: &mut StorageBuildState,
+) {
+    use pgrx::pg_sys::ScanDirection::ForwardScanDirection;
+    
+    // Get the parallel table scan descriptor from shared memory
+    let shm_toc = PARALLEL_SHM_TOC.with(|toc_cell| toc_cell.get());
+    if shm_toc.is_null() {
+        panic!("No shared memory TOC available for parallel scan");
+    }
+    let tablescandesc: *mut pg_sys::ParallelTableScanDescData = 
+        pg_sys::shm_toc_lookup(
+            shm_toc,
+            parallel::SHM_TOC_TABLESCANDESC_KEY,
+            false
+        ).cast::<pg_sys::ParallelTableScanDescData>();
+    
+    // Begin the parallel table scan
+    let scan = pg_sys::table_beginscan_parallel(heap_relation.as_ptr(), tablescandesc);
+    
+    // Create a tuple table slot for receiving tuples
+    let slot = pg_sys::table_slot_create(heap_relation.as_ptr(), std::ptr::null_mut());
+    
+    loop {
+        // Get next tuple from parallel scan
+        let has_tuple = pg_sys::table_scan_getnextslot(scan, ForwardScanDirection, slot);
+        
+        if !has_tuple {
+            break;
+        }
+        
+        // Get the tuple's ctid
+        let ctid = &(*slot).tts_tid;
+        
+        // Get the number of attributes
+        let natts = (*(*heap_relation.as_ptr()).rd_att).natts as usize;
+        
+        // Allocate arrays for values and nulls
+        let values = pg_sys::palloc(natts * std::mem::size_of::<pg_sys::Datum>()) as *mut pg_sys::Datum;
+        let isnull = pg_sys::palloc(natts * std::mem::size_of::<bool>()) as *mut bool;
+        
+        // Extract all attributes from the tuple slot
+        pg_sys::slot_getallattrs(slot);
+        
+        // Copy values and nulls from the slot
+        for i in 0..natts {
+            *values.add(i) = (*slot).tts_values.add(i).read();
+            *isnull.add(i) = (*slot).tts_isnull.add(i).read();
+        }
+        
+        // Call the build callback for this tuple
+        build_callback(
+            index_relation.as_ptr(),
+            ctid as *const pg_sys::ItemPointerData as *mut pg_sys::ItemPointerData,
+            values,
+            isnull,
+            true, // tuple_is_alive - assume true for parallel scan
+            state as *mut StorageBuildState as *mut std::os::raw::c_void,
+        );
+        
+        // Clean up allocated memory
+        pg_sys::pfree(values as *mut std::os::raw::c_void);
+        pg_sys::pfree(isnull as *mut std::os::raw::c_void);
+        
+        // Clear the slot for next tuple
+        pg_sys::ExecClearTuple(slot);
+    }
+    
+    // Clean up
+    pg_sys::ExecDropSingleTupleTableSlot(slot);
+    pg_sys::table_endscan(scan);
+}
+
+#[cfg(not(feature = "build_parallel"))]
+unsafe fn do_parallel_heap_scan(
+    _heap_relation: &PgRelation,
+    _index_relation: &PgRelation,
+    _index_info: *mut pg_sys::IndexInfo,
+    _state: &mut StorageBuildState,
+) {
+    panic!("Parallel build not enabled");
 }
 
 #[pg_guard]
